@@ -1,0 +1,9 @@
+{
+  "local_dir": "/path/to/local/directory",
+  "drive_folder_name": "BACKUPS",
+  "oauth": {
+    "client_id": "YOUR_OAUTH_CLIENT_ID",
+    "client_secret": "YOUR_OAUTH_CLIENT_SECRET",
+    "refresh_token": ""
+  }
+}
