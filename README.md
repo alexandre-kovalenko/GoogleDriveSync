@@ -40,6 +40,13 @@ access the destination folder and create files and subfolders there.
 go run . -config config.json
 ```
 
+Add `-quiet` to suppress per-file progress and completion messages while
+keeping errors and the final sync summary visible:
+
+```sh
+go run . -config config.json -quiet
+```
+
 The config path defaults to `config.json`. Files are uploaded recursively while
 retaining their relative directory structure, with up to four files uploading
 concurrently. Progress for active uploads is reported every 30 seconds with

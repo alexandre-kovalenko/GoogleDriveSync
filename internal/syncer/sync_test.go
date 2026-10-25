@@ -262,3 +262,35 @@ func TestUploadProgressReporterReportsPeriodically(t *testing.T) {
 		t.Fatalf("periodic progress output missing expected values: %q", got)
 	}
 }
+
+func TestQuietSyncSuppressesPerFileOutput(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "item.txt"), []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writer
+	syncErr := syncWithAPIOptions(context.Background(), &fakeDrive{}, root, "drive-root", SyncOptions{Quiet: true})
+	os.Stdout = originalStdout
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	if len(output) != 0 {
+		t.Errorf("quiet sync wrote per-file output: %q", output)
+	}
+}

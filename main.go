@@ -13,6 +13,7 @@ import (
 func main() {
 	configPath := flag.String("config", "config.json", "path to the JSON configuration file")
 	authorize := flag.Bool("authorize", false, "authorize Google Drive access and save a refresh token")
+	quiet := flag.Bool("quiet", false, "suppress per-file upload progress output")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -39,9 +40,9 @@ func main() {
 	}
 
 	if cfg.DriveFolderName != "" {
-		err = syncer.Sync(ctx, client, cfg.LocalDir, cfg.DriveFolderName)
+		err = syncer.SyncWithOptions(ctx, client, cfg.LocalDir, cfg.DriveFolderName, syncer.SyncOptions{Quiet: *quiet})
 	} else {
-		err = syncer.SyncByID(ctx, client, cfg.LocalDir, cfg.DriveFolderID)
+		err = syncer.SyncByIDWithOptions(ctx, client, cfg.LocalDir, cfg.DriveFolderID, syncer.SyncOptions{Quiet: *quiet})
 	}
 	if err != nil {
 		log.Fatal(err)

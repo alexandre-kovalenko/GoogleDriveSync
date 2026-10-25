@@ -25,6 +25,11 @@ type googleDriveAPI struct {
 	service *drive.Service
 }
 
+// SyncOptions controls optional sync behavior.
+type SyncOptions struct {
+	Quiet bool
+}
+
 const uploadWorkerCount = 4
 const UPLOAD_PROGRESS_INTERVAL = 30 * time.Second
 
@@ -98,22 +103,38 @@ func (g googleDriveAPI) UploadFile(ctx context.Context, name, parentID string, c
 // structure. A local file is removed only after Drive confirms the upload and
 // the file has not changed while it was being uploaded.
 func Sync(ctx context.Context, service *drive.Service, localDir, driveFolderName string) error {
-	return syncByFolderName(ctx, googleDriveAPI{service: service}, localDir, driveFolderName)
+	return SyncWithOptions(ctx, service, localDir, driveFolderName, SyncOptions{})
+}
+
+func SyncWithOptions(ctx context.Context, service *drive.Service, localDir, driveFolderName string, options SyncOptions) error {
+	return syncByFolderNameWithOptions(ctx, googleDriveAPI{service: service}, localDir, driveFolderName, options)
 }
 
 func SyncByID(ctx context.Context, service *drive.Service, localDir, driveFolderID string) error {
-	return syncWithAPI(ctx, googleDriveAPI{service: service}, localDir, driveFolderID)
+	return SyncByIDWithOptions(ctx, service, localDir, driveFolderID, SyncOptions{})
+}
+
+func SyncByIDWithOptions(ctx context.Context, service *drive.Service, localDir, driveFolderID string, options SyncOptions) error {
+	return syncWithAPIOptions(ctx, googleDriveAPI{service: service}, localDir, driveFolderID, options)
 }
 
 func syncByFolderName(ctx context.Context, api driveAPI, localDir, driveFolderName string) error {
+	return syncByFolderNameWithOptions(ctx, api, localDir, driveFolderName, SyncOptions{})
+}
+
+func syncByFolderNameWithOptions(ctx context.Context, api driveAPI, localDir, driveFolderName string, options SyncOptions) error {
 	folderID, err := api.ResolveRootFolder(ctx, driveFolderName)
 	if err != nil {
 		return fmt.Errorf("resolve Drive folder %q: %w", driveFolderName, err)
 	}
-	return syncWithAPI(ctx, api, localDir, folderID)
+	return syncWithAPIOptions(ctx, api, localDir, folderID, options)
 }
 
 func syncWithAPI(ctx context.Context, api driveAPI, localDir, driveFolderID string) error {
+	return syncWithAPIOptions(ctx, api, localDir, driveFolderID, SyncOptions{})
+}
+
+func syncWithAPIOptions(ctx context.Context, api driveAPI, localDir, driveFolderID string, options SyncOptions) error {
 	rootInfo, err := os.Stat(localDir)
 	if err != nil {
 		return fmt.Errorf("stat local directory: %w", err)
@@ -184,7 +205,7 @@ func syncWithAPI(ctx context.Context, api driveAPI, localDir, driveFolderID stri
 			go func() {
 				defer workers.Done()
 				for job := range jobs {
-					if err := uploadAndRemoveFile(ctx, api, job.path, job.name, job.parentID); err != nil {
+					if err := uploadAndRemoveFileWithOptions(ctx, api, job.path, job.name, job.parentID, options); err != nil {
 						results <- err
 					}
 				}
@@ -204,6 +225,10 @@ func syncWithAPI(ctx context.Context, api driveAPI, localDir, driveFolderID stri
 }
 
 func uploadAndRemoveFile(ctx context.Context, api driveAPI, path, name, parentID string) error {
+	return uploadAndRemoveFileWithOptions(ctx, api, path, name, parentID, SyncOptions{})
+}
+
+func uploadAndRemoveFileWithOptions(ctx context.Context, api driveAPI, path, name, parentID string, options SyncOptions) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
@@ -214,16 +239,22 @@ func uploadAndRemoveFile(ctx context.Context, api driveAPI, path, name, parentID
 		return errors.Join(fmt.Errorf("stat opened file %s: %w", path, err), closeErr)
 	}
 	uploaded := &atomic.Int64{}
-	stopProgress := make(chan struct{})
-	progressStopped := make(chan struct{})
-	started := time.Now()
-	go func() {
-		defer close(progressStopped)
-		reportUploadProgress(stopProgress, UPLOAD_PROGRESS_INTERVAL, os.Stdout, name, before.Size(), started, uploaded)
-	}()
+	var stopProgress chan struct{}
+	var progressStopped chan struct{}
+	if !options.Quiet {
+		stopProgress = make(chan struct{})
+		progressStopped = make(chan struct{})
+		started := time.Now()
+		go func() {
+			defer close(progressStopped)
+			reportUploadProgress(stopProgress, UPLOAD_PROGRESS_INTERVAL, os.Stdout, name, before.Size(), started, uploaded)
+		}()
+	}
 	uploadErr := api.UploadFile(ctx, name, parentID, &countingReader{reader: file, count: uploaded})
-	close(stopProgress)
-	<-progressStopped
+	if !options.Quiet {
+		close(stopProgress)
+		<-progressStopped
+	}
 	if uploadErr != nil {
 		closeErr := file.Close()
 		return errors.Join(fmt.Errorf("upload %s: %w", path, uploadErr), closeErr)
@@ -245,9 +276,11 @@ func uploadAndRemoveFile(ctx context.Context, api driveAPI, path, name, parentID
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("uploaded %s but could not remove local file: %w", path, err)
 	}
-	outputMu.Lock()
-	fmt.Printf("Uploaded and removed %s\n", path)
-	outputMu.Unlock()
+	if !options.Quiet {
+		outputMu.Lock()
+		fmt.Printf("Uploaded and removed %s\n", path)
+		outputMu.Unlock()
+	}
 	return nil
 }
 
