@@ -1,15 +1,22 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type fakeDrive struct {
+	mu         sync.Mutex
 	uploadErr  error
 	failName   string
 	uploaded   []string
@@ -18,21 +25,52 @@ type fakeDrive struct {
 	rootID     string
 	rootName   string
 	rootErr    error
+	active     int
+	maxActive  int
+	gate       chan struct{}
+	fourActive chan struct{}
+	signaled   bool
 }
 
 func (f *fakeDrive) ResolveRootFolder(_ context.Context, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.rootName = name
 	return f.rootID, f.rootErr
 }
 
 func (f *fakeDrive) EnsureFolder(_ context.Context, name, parentID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.folderNext++
 	f.folders = append(f.folders, filepath.Join(parentID, name))
 	return name, nil
 }
 
 func (f *fakeDrive) UploadFile(_ context.Context, name, parentID string, contents io.Reader) error {
+	f.mu.Lock()
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	if f.active == uploadWorkerCount && f.fourActive != nil && !f.signaled {
+		close(f.fourActive)
+		f.signaled = true
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
+
 	_, _ = io.Copy(io.Discard, contents)
+	if f.gate != nil {
+		<-f.gate
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.uploaded = append(f.uploaded, filepath.Join(parentID, name))
 	if name == f.failName {
 		return f.uploadErr
@@ -152,5 +190,75 @@ func TestSyncDoesNotUploadWhenNamedFolderCannotBeResolved(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("local file should remain after resolution failure: %v", err)
+	}
+}
+
+func TestSyncUploadsFourFilesConcurrently(t *testing.T) {
+	root := t.TempDir()
+	for i := range 8 {
+		path := filepath.Join(root, fmt.Sprintf("file-%d.txt", i))
+		if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := &fakeDrive{
+		gate:       make(chan struct{}),
+		fourActive: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- syncWithAPI(context.Background(), api, root, "drive-root")
+	}()
+
+	select {
+	case <-api.fourActive:
+		close(api.gate)
+	case <-time.After(5 * time.Second):
+		close(api.gate)
+		<-done
+		t.Fatal("sync did not run four uploads concurrently")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.maxActive != uploadWorkerCount {
+		t.Errorf("maximum concurrent uploads = %d, want %d", api.maxActive, uploadWorkerCount)
+	}
+	if len(api.uploaded) != 8 {
+		t.Errorf("uploaded %d files, want 8", len(api.uploaded))
+	}
+}
+
+func TestPrintUploadProgressIncludesUploadMetrics(t *testing.T) {
+	var output bytes.Buffer
+	printUploadProgress(&output, "archive.zip", 4096, 1024, 512)
+
+	want := "Upload progress [archive.zip]: 25.0% | 1.0 KiB/4.0 KiB uploaded | 3.0 KiB remaining | 512 B/s\n"
+	if output.String() != want {
+		t.Fatalf("progress output = %q, want %q", output.String(), want)
+	}
+}
+
+func TestUploadProgressReporterReportsPeriodically(t *testing.T) {
+	var output bytes.Buffer
+	uploaded := &atomic.Int64{}
+	uploaded.Store(1024)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reportUploadProgress(stop, 10*time.Millisecond, &output, "archive.zip", 4096, time.Now(), uploaded)
+	}()
+
+	time.Sleep(35 * time.Millisecond)
+	close(stop)
+	<-done
+
+	if got := output.String(); !strings.Contains(got, "archive.zip") || !strings.Contains(got, "25.0%") {
+		t.Fatalf("periodic progress output missing expected values: %q", got)
 	}
 }

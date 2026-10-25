@@ -41,6 +41,8 @@ go run . -config config.json
 ```
 
 The config path defaults to `config.json`. Files are uploaded recursively while
-retaining their relative directory structure. Empty directories are also
-created in Drive; local directories are not removed. Existing configurations
-with `drive_folder_id` remain supported.
+retaining their relative directory structure, with up to four files uploading
+concurrently. Progress for active uploads is reported every 30 seconds with
+file name, percentage, bytes uploaded and remaining, and upload speed. Empty
+directories are also created in Drive; local directories are not removed.
+Existing configurations with `drive_folder_id` remain supported.

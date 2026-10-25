@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"google.golang.org/api/drive/v3"
 )
@@ -20,6 +23,17 @@ type driveAPI interface {
 
 type googleDriveAPI struct {
 	service *drive.Service
+}
+
+const uploadWorkerCount = 4
+const UPLOAD_PROGRESS_INTERVAL = 30 * time.Second
+
+var outputMu sync.Mutex
+
+type uploadJob struct {
+	path     string
+	name     string
+	parentID string
 }
 
 func (g googleDriveAPI) EnsureFolder(ctx context.Context, name, parentID string) (string, error) {
@@ -115,6 +129,7 @@ func syncWithAPI(ctx context.Context, api driveAPI, localDir, driveFolderID stri
 
 	folderIDs := map[string]string{".": driveFolderID}
 	var syncErrors []error
+	var uploads []uploadJob
 	walkErr := filepath.WalkDir(absRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("walk %s: %w", path, walkErr)
@@ -155,47 +170,157 @@ func syncWithAPI(ctx context.Context, api driveAPI, localDir, driveFolderID stri
 			return nil
 		}
 
-		file, err := os.Open(path)
-		if err != nil {
-			syncErrors = append(syncErrors, fmt.Errorf("open %s: %w", path, err))
-			return nil
-		}
-		before, err := file.Stat()
-		if err != nil {
-			closeErr := file.Close()
-			syncErrors = append(syncErrors, errors.Join(fmt.Errorf("stat opened file %s: %w", path, err), closeErr))
-			return nil
-		}
-		if err := api.UploadFile(ctx, entry.Name(), parentID, file); err != nil {
-			closeErr := file.Close()
-			syncErrors = append(syncErrors, errors.Join(fmt.Errorf("upload %s: %w", path, err), closeErr))
-			return nil
-		}
-		if err := file.Close(); err != nil {
-			syncErrors = append(syncErrors, fmt.Errorf("close uploaded file %s: %w", path, err))
-			return nil
-		}
-
-		after, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			syncErrors = append(syncErrors, fmt.Errorf("stat after upload %s: %w", path, err))
-			return nil
-		}
-		if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
-			syncErrors = append(syncErrors, fmt.Errorf("uploaded %s but it changed locally; leaving it in place", path))
-			return nil
-		}
-		if err := os.Remove(path); err != nil {
-			syncErrors = append(syncErrors, fmt.Errorf("uploaded %s but could not remove local file: %w", path, err))
-			return nil
-		}
-		fmt.Printf("Uploaded and removed %s\n", path)
+		uploads = append(uploads, uploadJob{path: path, name: entry.Name(), parentID: parentID})
 		return nil
 	})
+
+	if len(uploads) > 0 {
+		workerCount := min(uploadWorkerCount, len(uploads))
+		jobs := make(chan uploadJob)
+		results := make(chan error, len(uploads))
+		var workers sync.WaitGroup
+		workers.Add(workerCount)
+		for range workerCount {
+			go func() {
+				defer workers.Done()
+				for job := range jobs {
+					if err := uploadAndRemoveFile(ctx, api, job.path, job.name, job.parentID); err != nil {
+						results <- err
+					}
+				}
+			}()
+		}
+		for _, job := range uploads {
+			jobs <- job
+		}
+		close(jobs)
+		workers.Wait()
+		close(results)
+		for err := range results {
+			syncErrors = append(syncErrors, err)
+		}
+	}
 	return errors.Join(walkErr, errors.Join(syncErrors...))
+}
+
+func uploadAndRemoveFile(ctx context.Context, api driveAPI, path, name, parentID string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	before, err := file.Stat()
+	if err != nil {
+		closeErr := file.Close()
+		return errors.Join(fmt.Errorf("stat opened file %s: %w", path, err), closeErr)
+	}
+	uploaded := &atomic.Int64{}
+	stopProgress := make(chan struct{})
+	progressStopped := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(progressStopped)
+		reportUploadProgress(stopProgress, UPLOAD_PROGRESS_INTERVAL, os.Stdout, name, before.Size(), started, uploaded)
+	}()
+	uploadErr := api.UploadFile(ctx, name, parentID, &countingReader{reader: file, count: uploaded})
+	close(stopProgress)
+	<-progressStopped
+	if uploadErr != nil {
+		closeErr := file.Close()
+		return errors.Join(fmt.Errorf("upload %s: %w", path, uploadErr), closeErr)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close uploaded file %s: %w", path, err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat after upload %s: %w", path, err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return fmt.Errorf("uploaded %s but it changed locally; leaving it in place", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("uploaded %s but could not remove local file: %w", path, err)
+	}
+	outputMu.Lock()
+	fmt.Printf("Uploaded and removed %s\n", path)
+	outputMu.Unlock()
+	return nil
+}
+
+type countingReader struct {
+	reader io.Reader
+	count  *atomic.Int64
+}
+
+func (r *countingReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		r.count.Add(int64(n))
+	}
+	return n, err
+}
+
+func reportUploadProgress(stop <-chan struct{}, interval time.Duration, output io.Writer, name string, total int64, started time.Time, uploaded *atomic.Int64) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	lastReport := started
+	var lastUploaded int64
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			current := uploaded.Load()
+			elapsed := now.Sub(lastReport).Seconds()
+			speed := int64(0)
+			if elapsed > 0 {
+				speed = int64(float64(current-lastUploaded) / elapsed)
+			}
+			outputMu.Lock()
+			printUploadProgress(output, name, total, current, speed)
+			outputMu.Unlock()
+			lastUploaded = current
+			lastReport = now
+		}
+	}
+}
+
+func printUploadProgress(output io.Writer, name string, total, uploaded, speed int64) {
+	percent := 100.0
+	remaining := int64(0)
+	if total > 0 {
+		percent = float64(uploaded) * 100 / float64(total)
+		if percent > 100 {
+			percent = 100
+		}
+		remaining = total - uploaded
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	_, _ = fmt.Fprintf(output, "Upload progress [%s]: %.1f%% | %s/%s uploaded | %s remaining | %s/s\n",
+		name, percent, formatBytes(uploaded), formatBytes(total), formatBytes(remaining), formatBytes(speed))
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	value := float64(bytes)
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	for _, unitName := range units {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, unitName)
+		}
+	}
+	return fmt.Sprintf("%.1f PiB", value/unit)
 }
 
 func ensureDrivePath(ctx context.Context, api driveAPI, cache map[string]string, relative, rootID string) (string, error) {
